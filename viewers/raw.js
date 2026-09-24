@@ -2,12 +2,12 @@
  * SPDX-FileCopyrightText: 2011 Red Hat, Inc. (original src/viewers/image.js)
  * SPDX-FileCopyrightText: 2026 Erick Salamanca (RAW adaptation)
  *
- * RAW image preview for GNOME Sushi, using the embedded JPEG preview
- * extracted by exiv2 (see ../thumbnailer/exiv2-thumbnailer.sh, also used
- * by the Nautilus grid-thumbnailer).
- *
- * Called with no size argument -> full-resolution preview (unlike the
- * grid thumbnailer, which passes a size to downscale).
+ * Full-resolution RAW image preview for GNOME Sushi (Space key in
+ * Nautilus), from the largest preview embedded in the RAW file, extracted
+ * with exiv2. Self-contained: it runs exiv2 itself and never touches the
+ * grid thumbnailer's script, so it installs alongside
+ * https://github.com/emuskardin/nautilus-raw-thumbnails without either
+ * one overwriting the other.
  *
  * Based on GNOME Sushi's built-in src/viewers/image.js (tested against
  * gnome-sushi 50.0 - the legacy GTK3/GJS-`imports` plugin API, loaded from
@@ -20,7 +20,22 @@ const {Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk} = imports.gi;
 
 const Renderer = imports.ui.renderer;
 
-const EXTRACT_SCRIPT = '/usr/local/bin/exiv2-thumbnailer.sh';
+// EXIF orientation (1-8) -> the transform that displays the image upright;
+// same mapping as gdk_pixbuf_apply_embedded_orientation() and as
+// ImageMagick's -flop/-flip/-transpose/-transverse in the upstream script.
+function applyOrientation(pix, orientation) {
+    const R = GdkPixbuf.PixbufRotation;
+    switch (orientation) {
+    case 2: return pix.flip(true);
+    case 3: return pix.rotate_simple(R.UPSIDEDOWN);
+    case 4: return pix.flip(false);
+    case 5: return pix.rotate_simple(R.CLOCKWISE).flip(true);
+    case 6: return pix.rotate_simple(R.CLOCKWISE);
+    case 7: return pix.rotate_simple(R.COUNTERCLOCKWISE).flip(true);
+    case 8: return pix.rotate_simple(R.COUNTERCLOCKWISE);
+    default: return pix;
+    }
+}
 
 var Klass = GObject.registerClass({
     Implements: [Renderer.Renderer],
@@ -48,7 +63,6 @@ var Klass = GObject.registerClass({
 
         this._pix = null;
         this._scaledSurface = null;
-        this._timeoutId = 0;
         this._tmpDir = null;
 
         this._extractPreview(file);
@@ -85,7 +99,7 @@ var Klass = GObject.registerClass({
         return false;
     }
 
-    _extractPreview(file) {
+    async _extractPreview(file) {
         let inPath = file.get_path();
         if (!inPath) {
             this.emit('error', new GLib.Error(
@@ -96,50 +110,147 @@ var Klass = GObject.registerClass({
 
         try {
             this._tmpDir = GLib.dir_make_tmp('sushi-raw-XXXXXX');
+            let pix = await this._loadPreview(inPath);
+            this._setPix(pix);
         } catch (e) {
-            this.emit('error', e);
-            return;
+            if (!e.matches || !e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                this.emit('error', e);
+        } finally {
+            this._cleanupTmpDir();
         }
-        let outPath = GLib.build_filenamev([this._tmpDir, 'preview.png']);
+    }
 
-        let proc;
-        try {
-            proc = Gio.Subprocess.new(
-                [EXTRACT_SCRIPT, inPath, outPath],
-                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
-        } catch (e) {
-            this.emit('error', e);
-            return;
+    async _loadPreview(inPath) {
+        // exiv2 lists previews smallest first, but pick by pixel count
+        // rather than trust the order: cameras often embed a tiny
+        // thumbnail next to a near-full-size JPEG, and only the latter is
+        // worth showing here.
+        let listing = await this._run(['exiv2', '-pp', inPath], true);
+        let best = null;
+        for (let line of listing.split('\n')) {
+            let m = line.match(/^Preview (\d+): ([^,]+), (\d+)x(\d+) pixels/);
+            if (!m)
+                continue;
+            let preview = {index: m[1], mime: m[2], pixels: Number(m[3]) * Number(m[4])};
+            if (!best || preview.pixels > best.pixels)
+                best = preview;
         }
+        if (!best)
+            throw this._failed('No embedded preview found in RAW file');
 
-        proc.wait_check_async(this._cancellable, (proc_, res) => {
-            let ok = false;
-            try {
-                ok = proc_.wait_check_finish(res);
-            } catch (e) {
-                ok = false;
+        // Written as <basename>-preview<N>.<ext> into our own tmp dir,
+        // never the caller's cwd (which may be read-only).
+        await this._run(['exiv2', `-ep${best.index}`, '-l', this._tmpDir, inPath]);
+        let previewPath = this._findExtracted(`-preview${best.index}.`);
+        if (!previewPath)
+            throw this._failed('exiv2 did not write the embedded preview');
+
+        // gdk-pixbuf loads the usual JPEG preview directly. Others (e.g.
+        // the uncompressed TIFF previews in phone DNGs) it may reject, so
+        // those go through ImageMagick first — to JPEG, not PNG: encoding
+        // a 50 MP PNG takes ~9 s, a JPEG ~1 s.
+        if (best.mime !== 'image/jpeg') {
+            let magick = GLib.find_program_in_path('magick') || GLib.find_program_in_path('convert');
+            if (magick) {
+                let jpegPath = GLib.build_filenamev([this._tmpDir, 'preview.jpg']);
+                await this._run([magick, previewPath, '-quality', '92', jpegPath]);
+                previewPath = jpegPath;
             }
+        }
 
-            if (!ok) {
-                this.emit('error', new GLib.Error(
-                    Gio.IOErrorEnum, Gio.IOErrorEnum.FAILED,
-                    'No embedded preview found in RAW file'));
+        let pix = await this._loadPixbuf(previewPath);
+        return applyOrientation(pix, await this._readOrientation(inPath));
+    }
+
+    // The orientation that matters is the RAW's own: the extracted preview
+    // usually carries none (or a stale one), which is also why the
+    // preview's embedded tag is deliberately ignored after loading.
+    async _readOrientation(inPath) {
+        try {
+            let out = await this._run(['exiv2', '-K', 'Exif.Image.Orientation', '-Pv', inPath], true);
+            let value = parseInt(out, 10);
+            if (value >= 1 && value <= 8)
+                return value;
+        } catch (e) {
+            if (this._cancellable.is_cancelled())
+                throw e;
+        }
+        // exiftool also knows maker-specific locations exiv2 doesn't
+        // expose under that key. Optional, like the upstream thumbnailer.
+        if (GLib.find_program_in_path('exiftool')) {
+            try {
+                let out = await this._run(['exiftool', '-s3', '-n', '-Orientation', inPath], true);
+                let value = parseInt(out, 10);
+                if (value >= 1 && value <= 8)
+                    return value;
+            } catch (e) {
+                if (this._cancellable.is_cancelled())
+                    throw e;
+            }
+        }
+        return 1;
+    }
+
+    _findExtracted(marker) {
+        let enumerator = Gio.File.new_for_path(this._tmpDir).enumerate_children(
+            'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        let info;
+        while ((info = enumerator.next_file(null))) {
+            if (info.get_name().includes(marker))
+                return GLib.build_filenamev([this._tmpDir, info.get_name()]);
+        }
+        return null;
+    }
+
+    _run(argv, captureStdout = false) {
+        return new Promise((resolve, reject) => {
+            let flags = Gio.SubprocessFlags.STDERR_SILENCE |
+                (captureStdout ? Gio.SubprocessFlags.STDOUT_PIPE : Gio.SubprocessFlags.STDOUT_SILENCE);
+            let proc;
+            try {
+                proc = Gio.Subprocess.new(argv, flags);
+            } catch (e) {
+                reject(e);
                 return;
             }
-
-            this._createImageTexture(Gio.File.new_for_path(outPath));
+            proc.communicate_utf8_async(null, this._cancellable, (proc_, res) => {
+                try {
+                    let [, stdout] = proc_.communicate_utf8_finish(res);
+                    if (!proc_.get_successful())
+                        throw this._failed(`${argv[0]} exited with status ${proc_.get_exit_status()}`);
+                    resolve(stdout || '');
+                } catch (e) {
+                    reject(e);
+                }
+            });
         });
     }
 
-    _createImageTexture(file) {
-        file.read_async(GLib.PRIORITY_DEFAULT, this._cancellable, (obj, res) => {
-            try {
-                let stream = obj.read_finish(res);
-                this._textureFromStream(stream);
-            } catch (e) {
-                this.emit('error', e);
-            }
+    _loadPixbuf(path) {
+        return new Promise((resolve, reject) => {
+            Gio.File.new_for_path(path).read_async(GLib.PRIORITY_DEFAULT, this._cancellable, (file, res) => {
+                let stream;
+                try {
+                    stream = file.read_finish(res);
+                } catch (e) {
+                    reject(e);
+                    return;
+                }
+                GdkPixbuf.Pixbuf.new_from_stream_async(stream, this._cancellable, (obj, res_) => {
+                    try {
+                        resolve(GdkPixbuf.Pixbuf.new_from_stream_finish(res_));
+                    } catch (e) {
+                        reject(e);
+                    } finally {
+                        stream.close(null);
+                    }
+                });
+            });
         });
+    }
+
+    _failed(message) {
+        return new GLib.Error(Gio.IOErrorEnum, Gio.IOErrorEnum.FAILED, message);
     }
 
     _ensureScaledPix() {
@@ -187,45 +298,6 @@ var Klass = GObject.registerClass({
         this.isReady();
     }
 
-    _textureFromStream(stream) {
-        GdkPixbuf.PixbufAnimation.new_from_stream_async(stream, this._cancellable, (obj, res) => {
-            let anim;
-            try {
-                anim = GdkPixbuf.PixbufAnimation.new_from_stream_finish(res);
-            } catch (e) {
-                this.emit('error', e);
-                return;
-            }
-
-            this._iter = anim.get_iter(null);
-            this._update();
-
-            stream.close_async(GLib.PRIORITY_DEFAULT, this._cancellable, (obj_, res_) => {
-                try {
-                    obj_.close_finish(res_);
-                } catch (e) {
-                    logError(e, 'Unable to close the stream');
-                }
-                this._cleanupTmpDir();
-            });
-         });
-    }
-
-    _update() {
-        this._setPix(this._iter.get_pixbuf().apply_embedded_orientation());
-
-        let delay = this._iter.get_delay_time();
-        if (delay == -1)
-            return;
-
-        this._timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
-            this._timeoutId = 0;
-            if (this._iter.advance(null))
-                this._update();
-            return false;
-        });
-    }
-
     get resizePolicy() {
         return Renderer.ResizePolicy.SCALED;
     }
@@ -233,25 +305,25 @@ var Klass = GObject.registerClass({
     _cleanupTmpDir() {
         if (!this._tmpDir)
             return;
+        // Best-effort: the dir only ever holds the preview exiv2 wrote
+        // and, for non-JPEG previews, the converted copy.
         try {
             let dir = Gio.File.new_for_path(this._tmpDir);
-            let child = dir.get_child('preview.png');
-            child.delete(null);
+            let enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            while ((info = enumerator.next_file(null)))
+                dir.get_child(info.get_name()).delete(null);
             dir.delete(null);
         } catch (e) {
-            // best-effort cleanup, ignore failures
+            // ignore
         }
         this._tmpDir = null;
     }
 
     _onDestroy() {
-        if (this._timeoutId) {
-            GLib.source_remove(this._timeoutId);
-            this._timeoutId = 0;
-        }
-
+        // _extractPreview's finally clears the tmp dir once the cancelled
+        // steps unwind.
         this._cancellable.cancel();
-        this._cleanupTmpDir();
     }
 });
 

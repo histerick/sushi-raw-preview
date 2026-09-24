@@ -1,99 +1,86 @@
 # sushi-raw-preview
 
-Full RAW image preview in [GNOME Sushi](https://gitlab.gnome.org/GNOME/sushi) (the
-Space-key Quick Look for Nautilus/Files), plus a downscaled RAW thumbnailer for the
-Nautilus grid view — both powered by the same script, which extracts the RAW file's
-embedded JPEG preview with `exiv2` instead of decoding the full RAW (fast, no
-`dcraw`/`libraw` decode needed).
+An add-on for [nautilus-raw-thumbnails](https://github.com/emuskardin/nautilus-raw-thumbnails):
+that project gives you RAW thumbnails in the Nautilus grid, this one adds a
+**full-size preview when you press Space** on a RAW file in
+[GNOME Sushi](https://gitlab.gnome.org/GNOME/sushi) (Nautilus/Files' Quick Look),
+instead of a generic icon.
 
-| | |
-|---|---|
-| **Nautilus grid** | Small thumbnail, downscaled (`exiv2raw.thumbnailer`, standard freedesktop.org thumbnailer) |
-| **Sushi (Space key)** | Full-resolution preview (`viewers/raw.js`, Sushi plugin) |
+It uses the same idea — show the preview the camera already embedded in the RAW
+file, extracted with `exiv2`, rather than decoding the whole RAW — and picks the
+**largest** embedded preview, so you get the near-full-size image rather than the
+tiny thumbnail most cameras also embed.
 
-Covers `.ORF, .ARW, .NEF, .RAF, .CR2, .CR3, .DNG, .RW2` and more (Canon CRW, Sony
-SR2/SRF, Panasonic RW2, Fuji RAF, Sigma X3F, Minolta MRW, etc. — see `MimeType=` in
-`exiv2raw.thumbnailer`), for any RAW format with an embedded preview (the vast
-majority do).
-
-## Why
-
-[`emuskardin/nautilus-raw-thumbnails`](https://github.com/emuskardin/nautilus-raw-thumbnails)
-already solves the grid-thumbnail half of this. This project forks that script to
-also:
-- downscale the grid thumbnail properly (the original wrote the full-size embedded
-  preview straight into the thumbnail cache — fine for one photo, not for a folder
-  full of them), while
-- adding a **Sushi plugin** so pressing Space on a RAW file shows an actual
-  full-resolution preview instead of a generic icon.
+Works with any RAW format that has an embedded preview (the vast majority):
+`.ORF, .ARW, .NEF, .RAF, .CR2, .CR3, .DNG, .RW2`, and more — see `mimeTypes` at
+the end of `viewers/raw.js`.
 
 ## Install
+
+It's a single file, installed per user — no `sudo` needed for the plugin itself.
 
 ### 1. Dependencies
 
 ```bash
-sudo apt install exiv2 imagemagick libimage-exiftool-perl   # Debian/Ubuntu
+# Debian/Ubuntu
+sudo apt install exiv2 imagemagick libimage-exiftool-perl
+# Fedora
+# sudo dnf install exiv2 ImageMagick perl-Image-ExifTool
 ```
 
-### 2. Grid thumbnailer (Nautilus/Nemo/Caja)
+These are the same dependencies as nautilus-raw-thumbnails. Only `exiv2` is
+strictly required here: ImageMagick is used for the non-JPEG previews some
+phones embed (e.g. TIFF in Samsung DNGs), and `exiftool` is a fallback for
+reading the photo's orientation.
+
+### 2. The plugin
 
 ```bash
-sudo cp thumbnailer/exiv2-thumbnailer.sh /usr/local/bin/
-sudo chmod +x /usr/local/bin/exiv2-thumbnailer.sh
-sudo cp thumbnailer/exiv2raw.thumbnailer /usr/share/thumbnailers/
-
-nautilus -q          # restart Nautilus to pick it up
-rm -rf ~/.cache/thumbnails/*   # force regeneration
-```
-
-### 3. Sushi plugin (Space-key full preview)
-
-Only tested against **GNOME Sushi 50.x**, which uses the legacy GTK3/GJS
-`imports`-based plugin system (`~/.local/share/sushi/viewers/*.js`). Check your
-version with `dpkg -l gnome-sushi` / `gnome-sushi --version` before installing.
-
-```bash
+git clone https://github.com/histerick/sushi-raw-preview.git
 mkdir -p ~/.local/share/sushi/viewers
-cp viewers/raw.js ~/.local/share/sushi/viewers/
+cp sushi-raw-preview/viewers/raw.js ~/.local/share/sushi/viewers/
 ```
 
-No restart needed — Sushi is DBus-activated and picks up plugins on next launch.
+No restart needed: Sushi picks up plugins the next time it opens.
+
+### 3. Grid thumbnails (optional, recommended)
+
+For thumbnails in the Nautilus grid too, install
+[nautilus-raw-thumbnails](https://github.com/emuskardin/nautilus-raw-thumbnails)
+following its README. The two are independent: this plugin doesn't use or
+replace any of that project's files, so either one can be installed, updated
+or removed without affecting the other.
+
+### Uninstall
+
+```bash
+rm ~/.local/share/sushi/viewers/raw.js
+```
 
 ## How it works
 
-`exiv2-thumbnailer.sh <input> <output.png> [max-size]`:
-1. Extracts the RAW's embedded JPEG preview with `exiv2 -ep1` into a private tmp
-   dir (not the caller's cwd — important, since Nautilus/Sushi may invoke this
-   with an arbitrary/read-only working directory, e.g. when browsing a network
-   share).
-2. Reads EXIF orientation with `exiftool` and rotates/flips accordingly with
-   ImageMagick.
-3. If a `max-size` argument is given, downscales to fit within that box
-   (never upscales). The Nautilus `.thumbnailer` entry passes the standard
-   freedesktop.org `%s` placeholder here. The Sushi plugin omits it, so Sushi
-   always gets the full-resolution preview.
+When you press Space on a RAW file, `viewers/raw.js`:
 
-`viewers/raw.js` is a Sushi `Renderer` (based on Sushi's own built-in
-`src/viewers/image.js`) that runs the script above with no size argument, loads
-the resulting PNG as a `GdkPixbuf`, and displays it exactly like Sushi's native
-image viewer — just fed from an extracted preview instead of a directly
-pixbuf-loadable file.
+1. Lists the previews embedded in the file (`exiv2 -pp`) and picks the largest.
+2. Extracts it (`exiv2 -ep<N>`) into a private temporary directory — never the
+   current directory, which may be read-only (e.g. a network share).
+3. Loads it directly if it's a JPEG. Other formats are converted to JPEG with
+   ImageMagick first (a JPEG, not a PNG: for a 50 MP phone preview that's ~1 s
+   instead of ~9 s).
+4. Rotates/flips it according to the RAW file's EXIF orientation.
+5. Shows it just like Sushi's own image viewer does, and deletes the temporary
+   files.
 
 ## Compatibility
 
-- **gnome-sushi ≤ 50.x**: works, as shipped here.
-- **gnome-sushi ≥ 51**: Sushi is being rewritten to GTK4/Adwaita/Glycin
-  on `main` at the time of writing, with a new plugin system
-  (`~/.local/share/sushi/plugins-1/`, ES modules, `resource://.../plugin-api-1.js`).
-  `viewers/raw.js` as written here will **not** load on that version — it needs
-  porting to the new API. PRs welcome.
+- **gnome-sushi ≤ 50.x** (GTK3, the legacy `~/.local/share/sushi/viewers/*.js`
+  plugin system): works. Tested on gnome-sushi 50.0 (Ubuntu 26.04).
+- **gnome-sushi ≥ 51**: Sushi is being rewritten to GTK4/Adwaita/Glycin, with a
+  new plugin system (`~/.local/share/sushi/plugins-1/`, ES modules).
+  `viewers/raw.js` will **not** load there as-is — it needs porting to the new
+  API. PRs welcome.
 
 ## License
 
-- `viewers/raw.js` is derived from GNOME Sushi's own source and is
-  **GPL-2.0-or-later** (see file header).
-- `thumbnailer/exiv2-thumbnailer.sh` is forked from
-  [emuskardin/nautilus-raw-thumbnails](https://github.com/emuskardin/nautilus-raw-thumbnails)
-  and stays **MIT** (see file header and `LICENSE-MIT`).
-
-See `LICENSE-GPL-2.0-or-later` and `LICENSE-MIT`.
+`viewers/raw.js` is derived from GNOME Sushi's own `src/viewers/image.js` and is
+**GPL-2.0-or-later** (see the file header and `LICENSE-GPL-2.0-or-later`).
